@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>横浜ルート検索（pgRouting）</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+    #map { position: absolute; inset: 0; }
+    #panel {
+      position: absolute; top: 12px; right: 12px; z-index: 1000; width: 280px;
+      background: #fff; border-radius: 8px; padding: 12px 14px;
+      box-shadow: 0 2px 10px rgba(0,0,0,.25); font-size: 14px; line-height: 1.5;
+    }
+    #panel h1 { font-size: 16px; margin: 0 0 6px; }
+    #msg { margin: 6px 0; color: #333; }
+    #msg.error { color: #c0392b; }
+    #result { margin: 8px 0; font-size: 15px; }
+    #result b { font-size: 20px; }
+    .buttons { display: flex; gap: 8px; }
+    button { flex: 1; padding: 6px 8px; font-size: 13px; cursor: pointer; }
+    .note { color: #777; font-size: 12px; margin-top: 8px; }
+    @media (max-width: 600px) {
+      #panel { left: 12px; right: 12px; width: auto; top: auto; bottom: 24px; }
+    }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>横浜ルート検索</h1>
+  <div id="msg">地図をクリックして<b>現在地</b>を指定してください。</div>
+  <div id="result"></div>
+  <div class="buttons">
+    <button id="locate">現在地を使う</button>
+    <button id="reset">リセット</button>
+  </div>
+  <div class="note">点線の枠内が対象範囲です。所要時間は道路種別ごとの想定速度で計算した目安です（信号・渋滞は考慮しません）。マーカーはドラッグで動かせます。</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([35.47, 139.63], 13);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+}).addTo(map);
+
+const msgEl = document.getElementById('msg');
+const resultEl = document.getElementById('result');
+let bbox = null;           // [min_lon, min_lat, max_lon, max_lat]
+let start = null, goal = null;
+let routeLayer = null, snapLayer = L.layerGroup().addTo(map);
+
+function setMsg(html, isError = false) {
+  msgEl.innerHTML = html;
+  msgEl.className = isError ? 'error' : '';
+}
+
+function inBbox(latlng) {
+  return bbox && latlng.lng >= bbox[0] && latlng.lng <= bbox[2]
+              && latlng.lat >= bbox[1] && latlng.lat <= bbox[3];
+}
+
+function makeMarker(latlng, label, color) {
+  const icon = L.divIcon({
+    className: '',
+    html: `<div style="background:${color};color:#fff;border-radius:50%;width:26px;height:26px;
+           display:flex;align-items:center;justify-content:center;font-weight:bold;
+           border:2px solid #fff;box-shadow:0 0 4px rgba(0,0,0,.5)">${label}</div>`,
+    iconSize: [26, 26], iconAnchor: [13, 13],
+  });
+  const m = L.marker(latlng, { icon, draggable: true }).addTo(map);
+  m.on('dragend', () => {
+    if (!inBbox(m.getLatLng())) { setMsg('対象範囲外です。枠内に置いてください。', true); return; }
+    if (start && goal) fetchRoute();
+  });
+  return m;
+}
+
+function setStart(latlng) {
+  if (start) start.setLatLng(latlng); else start = makeMarker(latlng, 'S', '#2980b9');
+  if (goal) fetchRoute(); else setMsg('次に地図をクリックして<b>目的地</b>を指定してください。');
+}
+
+function setGoal(latlng) {
+  goal = makeMarker(latlng, 'G', '#c0392b');
+  fetchRoute();
+}
+
+map.on('click', (e) => {
+  if (!inBbox(e.latlng)) { setMsg('対象範囲外です。点線の枠内をクリックしてください。', true); return; }
+  if (!start) setStart(e.latlng);
+  else if (!goal) setGoal(e.latlng);
+  else setMsg('やり直すには「リセット」を押すか、マーカーをドラッグしてください。');
+});
+
+async function fetchRoute() {
+  const s = start.getLatLng(), g = goal.getLatLng();
+  const q = new URLSearchParams({ from_lat: s.lat, from_lon: s.lng, to_lat: g.lat, to_lon: g.lng });
+  setMsg('ルートを計算中…');
+  resultEl.innerHTML = '';
+  try {
+    const res = await fetch('/api/route?' + q);
+    const data = await res.json();
+    if (!res.ok) throw new Error(errorText(res.status, data.detail));
+    drawRoute(data);
+  } catch (err) {
+    if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+    snapLayer.clearLayers();
+    setMsg(err.message, true);
+  }
+}
+
+function errorText(status, detail) {
+  if (status === 404) return 'ルートが見つかりませんでした。';
+  if (detail && detail.includes('same intersection')) return '現在地と目的地が近すぎます（同じ交差点になりました）。';
+  if (detail && detail.includes('outside')) return '対象範囲外の地点が含まれています。';
+  return 'エラーが発生しました: ' + (detail || status);
+}
+
+function drawRoute(data) {
+  if (routeLayer) map.removeLayer(routeLayer);
+  snapLayer.clearLayers();
+  routeLayer = L.geoJSON(data, { style: { color: '#8e44ad', weight: 6, opacity: 0.85 } }).addTo(map);
+
+  // Dashed lines from each click to the intersection it snapped to.
+  const p = data.properties;
+  for (const [marker, node] of [[start, p.from_node], [goal, p.to_node]]) {
+    L.polyline([marker.getLatLng(), [node.lat, node.lon]], { color: '#555', dashArray: '4 6', weight: 2 }).addTo(snapLayer);
+  }
+
+  const km = (p.length_m / 1000).toFixed(2);
+  const min = Math.max(1, Math.round(p.seconds / 60));
+  resultEl.innerHTML = `距離 <b>${km}</b> km ／ 所要 約 <b>${min}</b> 分`;
+  setMsg('ルートを表示しました。');
+  map.fitBounds(routeLayer.getBounds(), { padding: [40, 40] });
+}
+
+document.getElementById('reset').onclick = () => {
+  for (const m of [start, goal]) if (m) map.removeLayer(m);
+  if (routeLayer) map.removeLayer(routeLayer);
+  snapLayer.clearLayers();
+  start = goal = routeLayer = null;
+  resultEl.innerHTML = '';
+  setMsg('地図をクリックして<b>現在地</b>を指定してください。');
+};
+
+document.getElementById('locate').onclick = () => {
+  if (!navigator.geolocation) { setMsg('このブラウザは位置情報に対応していません。', true); return; }
+  setMsg('現在地を取得中…');
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      const latlng = L.latLng(pos.coords.latitude, pos.coords.longitude);
+      if (!inBbox(latlng)) {
+        setMsg('現在地が対象範囲外のため使えません。地図をクリックして指定してください。', true);
+        return;
+      }
+      map.panTo(latlng);
+      setStart(latlng);
+    },
+    (err) => setMsg('現在地を取得できませんでした（' + err.message + '）。', true),
+    { enableHighAccuracy: true, timeout: 10000 },
+  );
+};
+
+fetch('/api/config').then(r => r.json()).then(cfg => {
+  bbox = cfg.bbox;
+  const bounds = [[bbox[1], bbox[0]], [bbox[3], bbox[2]]];
+  L.rectangle(bounds, { color: '#333', weight: 2, dashArray: '6 6', fill: false, interactive: false }).addTo(map);
+  map.fitBounds(bounds);
+});
+</script>
+</body>
+</html>
